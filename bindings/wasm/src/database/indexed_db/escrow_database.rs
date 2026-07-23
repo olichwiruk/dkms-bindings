@@ -64,7 +64,10 @@ impl EscrowDatabase for IndexedDbEscrowDatabase {
     fn insert(&self, event: &SignedEventMessage) -> Result<(), Self::Error> {
         self.log
             .log_event_with_new_transaction(event)?;
-        let said = event.event_message.digest().unwrap();
+        let said = event
+            .event_message
+            .digest()
+            .map_err(|_| IndexedDbError::MissingDigest)?;
         let id = event.event_message.data.get_prefix();
         let sn = event.event_message.data.sn;
         self.escrow.insert(&id, sn, &said)?;
@@ -80,7 +83,10 @@ impl EscrowDatabase for IndexedDbEscrowDatabase {
     ) -> Result<(), Self::Error> {
         self.log
             .log_event_with_new_transaction(event)?;
-        let said = event.event_message.digest().unwrap();
+        let said = event
+            .event_message
+            .digest()
+            .map_err(|_| IndexedDbError::MissingDigest)?;
 
         self.escrow.insert(id, sn, &said)?;
 
@@ -124,10 +130,20 @@ impl EscrowDatabase for IndexedDbEscrowDatabase {
     }
 
     fn remove(&self, event: &KeriEvent<KeyEvent>) {
-        let said = event.digest().unwrap();
+        // The trait signature does not allow returning an error here, so log
+        // failures instead of panicking.
+        let said = match event.digest() {
+            Ok(said) => said,
+            Err(e) => {
+                log::error!("Failed to compute digest of escrowed event: {}", e);
+                return;
+            }
+        };
         let id = event.data.get_prefix();
         let sn = event.data.sn;
-        self.escrow.remove(&id, sn, &said).unwrap();
+        if let Err(e) = self.escrow.remove(&id, sn, &said) {
+            log::error!("Failed to remove event from escrow: {}", e);
+        }
     }
 
     fn contains(

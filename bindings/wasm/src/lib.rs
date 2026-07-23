@@ -20,7 +20,9 @@ use url::Url;
 use wasm_bindgen::prelude::*;
 
 pub mod database;
+pub mod error;
 use crate::database::indexed_db::IndexedDbDatabase as Database;
+use crate::error::WasmError;
 
 #[wasm_bindgen]
 pub enum VcState {
@@ -56,56 +58,54 @@ impl JsIdentifier {
         self.inner.get_prefix().to_string()
     }
 
-    pub fn get_kel(&self) -> String {
-        format!("{:?}", self.inner.get_own_kel().unwrap())
+    pub fn get_kel(&self) -> Result<String, WasmError> {
+        let kel = self.inner.get_own_kel().ok_or_else(|| {
+            WasmError::IdentifierNotFound(self.inner.get_prefix().to_string())
+        })?;
+        Ok(format!("{:?}", kel))
     }
 
-    pub fn set_alias(&mut self, alias: String) -> Result<(), JsValue> {
-        self.db.update_identifier_alias(&self.alias, &alias).map_err(|e| JsValue::from_str(&format!("Failed to update alias in DB: {}", e)))?;
+    pub fn set_alias(&mut self, alias: String) -> Result<(), WasmError> {
+        self.db.update_identifier_alias(&self.alias, &alias)?;
         self.alias = alias;
         Ok(())
     }
 
-    pub async fn add_watcher(&mut self, url: String) -> Result<(), JsValue> {
-        let url = Url::parse(&url)
-            .map_err(|e| JsValue::from_str(&format!("Invalid URL: {}", e)))?;
-        let res = Request::get(url.join("introduce").unwrap().as_str())
+    pub async fn add_watcher(&mut self, url: String) -> Result<(), WasmError> {
+        let url = Url::parse(&url)?;
+        let res = Request::get(url.join("introduce")?.as_str())
             .send()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let res_str = res.text().await.map_err(|e| {
-            JsValue::from_str(&format!("Failed to get response: {}", e))
-        })?;
-        let oobi: LocationScheme =
-            serde_json::from_str(&res_str).map_err(|e| {
-                JsValue::from_str(&format!("Failed to parse OOBI: {}", e))
-            })?;
+            .await?;
+        let res_str = res.text().await?;
+        let oobi: LocationScheme = serde_json::from_str(&res_str)?;
         self.watcher_oobi = Some(oobi.clone());
         let watcher_prefix = oobi.clone().eid;
 
         let add_watcher_event = self
             .inner
             .add_watcher(watcher_prefix.clone())
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to add watcher: {}", e))
-            })?;
+            .map_err(WasmError::Controller)?;
 
+        let signature = self
+            .signer
+            .sign(add_watcher_event.as_bytes())
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
         let sig = SelfSigningPrefix::new(
             cesrox::primitives::codes::self_signing::SelfSigning::Ed25519Sha512,
-            self.signer.sign(add_watcher_event.as_bytes()).unwrap(),
+            signature,
         );
         let (_, messages) = self
             .inner
             .finalize_add_watcher(add_watcher_event.as_bytes(), sig)
-            .unwrap();
+            .map_err(WasmError::Controller)?;
 
         for message in messages {
             let request_url: Option<String> = match message {
                 Message::Notice(_) => {
-                    Some(url.join("process").unwrap().to_string())
+                    Some(url.join("process")?.to_string())
                 }
                 Message::Op(Op::Reply(_)) => {
-                    Some(url.join("register").unwrap().to_string())
+                    Some(url.join("register")?.to_string())
                 }
                 _ => {
                     log::warn!("Unsupported message type: {:?}", message);
@@ -113,22 +113,19 @@ impl JsIdentifier {
                 }
             };
             if let Some(request_url) = request_url {
-                let body =
-                    Uint8Array::from(message.to_cesr().unwrap().as_slice());
+                let cesr = message
+                    .to_cesr()
+                    .map_err(|e| WasmError::Cesr(e.to_string()))?;
+                let body = Uint8Array::from(cesr.as_slice());
                 let _ = Request::post(&request_url)
                     .header("Content-Type", "application/json")
-                    .body(&body)
-                    .unwrap()
+                    .body(&body)?
                     .send()
-                    .await
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
+                    .await?;
             }
         }
 
-        self.db.update_identifier_watcher(
-            &self.alias,
-            oobi.clone(),
-        ).map_err(|e| JsValue::from_str(&format!("Failed to update identifier in DB: {}", e)))?;
+        self.db.update_identifier_watcher(&self.alias, oobi.clone())?;
 
         Ok(())
     }
@@ -165,8 +162,10 @@ impl Default for KeysConfig {
 #[wasm_bindgen]
 impl JsController {
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<JsController, JsValue> {
-        log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER).unwrap();
+    pub fn new() -> Result<JsController, WasmError> {
+        // Setting the logger fails when one is already installed (e.g. a
+        // second controller is constructed) — keep the existing logger then.
+        let _ = log::set_logger(&wasm_bindgen_console_logger::DEFAULT_LOGGER);
         log::set_max_level(log::LevelFilter::Info);
 
         let event_database = Arc::new(Database::new());
@@ -184,23 +183,23 @@ impl JsController {
     pub fn load_identifier(
         &self,
         alias: String,
-    ) -> Result<JsIdentifier, JsValue> {
+    ) -> Result<JsIdentifier, WasmError> {
         let id_record = self
             .db
             .get_identifier(&alias)
-            .ok_or_else(|| JsValue::from_str("Identifier not found"))?;
+            .ok_or_else(|| WasmError::IdentifierNotFound(alias.clone()))?;
 
         let identifier = self
             .inner
             .load_identifier(&id_record.said)
-            .map_err(|e| JsValue::from_str(&format!("Load identifier error: {}", e)))?;
+            .map_err(WasmError::Controller)?;
         let signer = Signer::new_with_seed(&id_record.seed)
-            .map_err(|e| JsValue::from_str(&format!("Signer creation error: {}", e)))?;
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
 
         Ok(JsIdentifier::new(alias, identifier, Arc::new(signer), self.db.clone(), id_record.watcher_oobi))
     }
 
-    pub fn get_identifier_aliases(&self) -> Result<Vec<JsValue>, JsValue> {
+    pub fn get_identifier_aliases(&self) -> Result<Vec<JsValue>, WasmError> {
         let aliases: Vec<JsValue> = self
             .db
             .get_identifiers()
@@ -210,53 +209,50 @@ impl JsController {
         Ok(aliases)
     }
 
-    pub fn incept(&self) -> Result<JsIdentifier, JsValue> {
+    pub fn incept(&self) -> Result<JsIdentifier, WasmError> {
         let keys = KeysConfig::default();
         let (next_pub_key, _next_secret_keys) =
-            match keys.next.derive_key_pair() {
-                Ok(pair) => pair,
-                Err(e) => {
-                    return Err(JsValue::from_str(&format!(
-                        "Failed to derive keys: {}",
-                        e
-                    )))
-                }
-            };
+            keys.next.derive_key_pair().map_err(|e| {
+                WasmError::Signing(format!("failed to derive keys: {}", e))
+            })?;
 
-        let signer = match Signer::new_with_seed(&keys.current.clone()) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                return Err(JsValue::from_str(&format!(
-                    "Failed to create signer: {}",
-                    e
-                )))
-            }
-        };
+        let signer = Signer::new_with_seed(&keys.current)
+            .map(Arc::new)
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
 
         let next_pub_keys = vec![BasicPrefix::Ed25519NT(next_pub_key)];
         let public_keys = vec![BasicPrefix::Ed25519(signer.public_key())];
 
         let signing_inception =
-            self.inner
-                .incept(public_keys, next_pub_keys)
-                .map_err(|_| JsValue::from_str("Incept error"))?;
+            self.inner.incept(public_keys, next_pub_keys).map_err(|()| {
+                WasmError::Controller(
+                    "inception event generation failed".to_string(),
+                )
+            })?;
+        let signature = signer
+            .sign(signing_inception.as_bytes())
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
         let signature = SelfSigningPrefix::new(
             cesrox::primitives::codes::self_signing::SelfSigning::Ed25519Sha512,
-            signer.sign(signing_inception.as_bytes()).unwrap(),
+            signature,
         );
         let signing_identifier = self
             .inner
             .finalize_incept(signing_inception.as_bytes(), &signature)
-            .map_err(|_| JsValue::from_str("Finalize error"))?;
+            .map_err(|()| {
+                WasmError::Controller("inception finalization failed".to_string())
+            })?;
 
-        let kel = format!("{:?}", signing_identifier.get_own_kel().unwrap());
-        self.process_kel(kel, None, None)?;
+        let kel = signing_identifier.get_own_kel().ok_or_else(|| {
+            WasmError::IdentifierNotFound(
+                signing_identifier.get_prefix().to_string(),
+            )
+        })?;
+        self.process_kel(format!("{:?}", kel), None, None)?;
 
         let prefix = signing_identifier.get_prefix();
         let alias = prefix.to_string();
-        self.db.add_identifier(&alias, &prefix.clone(), &keys.current).map_err(|e| {
-            JsValue::from_str(&format!("Failed to add identifier to DB: {}", e))
-        })?;
+        self.db.add_identifier(&alias, &prefix.clone(), &keys.current)?;
 
         Ok(JsIdentifier::new(alias, signing_identifier, signer.clone(), self.db.clone(), None))
     }
@@ -266,10 +262,10 @@ impl JsController {
         kel: String,
         from: Option<u64>,
         limit: Option<u64>,
-    ) -> Result<(), JsValue> {
+    ) -> Result<(), WasmError> {
         let mut parsed_kel: Vec<Message> = parse_event_stream(kel.as_bytes())
             .map_err(|e| {
-                JsValue::from_str(&format!("Failed to parse KEL: {}", e))
+                WasmError::Cesr(format!("failed to parse KEL: {}", e))
             })?;
         if let Some(from) = from {
             parsed_kel = parsed_kel
@@ -284,35 +280,35 @@ impl JsController {
                 .collect();
         }
 
-        self.inner.process_kel(&parsed_kel).map_err(|e| {
-            JsValue::from_str(&format!("Process events error: {}", e))
-        })?;
+        self.inner
+            .process_kel(&parsed_kel)
+            .map_err(WasmError::Controller)?;
 
         Ok(())
     }
 
-    pub fn process_tel(&self, tel: String) -> Result<(), JsValue> {
-        self.inner.process_tel(tel.as_bytes()).map_err(|e| {
-            JsValue::from_str(&format!("Process events error: {}", e))
-        })?;
+    pub fn process_tel(&self, tel: String) -> Result<(), WasmError> {
+        self.inner
+            .process_tel(tel.as_bytes())
+            .map_err(WasmError::Controller)?;
 
         Ok(())
     }
 
-    pub fn get_vc_state(&self, prefix: String) -> Result<VcState, JsValue> {
+    pub fn get_vc_state(&self, prefix: String) -> Result<VcState, WasmError> {
         let said: SelfAddressingIdentifier = prefix.parse().map_err(|e| {
-            JsValue::from_str(&format!("Invalid prefix: {}", e))
+            WasmError::InvalidInput(format!("invalid prefix: {}", e))
         })?;
 
-        self.inner.get_vc_state(&said)
-            .map_err(|e| JsValue::from_str(&format!("Get VC state error: {}", e)))
-            .map(|state| {
-                match state {
-                    Some(TelState::Issued(_)) => VcState::Issued,
-                    Some(TelState::Revoked) => VcState::Revoked,
-                    None | Some(TelState::NotIssued) => VcState::NotIssued,
-                }
-            })
+        let state = self
+            .inner
+            .get_vc_state(&said)
+            .map_err(WasmError::Controller)?;
+        Ok(match state {
+            Some(TelState::Issued(_)) => VcState::Issued,
+            Some(TelState::Revoked) => VcState::Revoked,
+            None | Some(TelState::NotIssued) => VcState::NotIssued,
+        })
     }
 
     pub async fn verify(
@@ -320,69 +316,59 @@ impl JsController {
         identifier: &JsIdentifier,
         oobi_array: JsValue,
         message: String,
-    ) -> Result<JsValue, JsValue> {
+    ) -> Result<JsValue, WasmError> {
         let (_rest, cesr) = cesrox::parse(message.as_bytes()).map_err(|e| {
-            JsValue::from_str(&format!("Failed to parse CESR: {}", e))
+            WasmError::Cesr(format!("failed to parse CESR: {}", e))
         })?;
         let att: acdc::Attestation = match cesr.payload {
             cesrox::payload::Payload::JSON(items) => {
-                serde_json::from_slice(&items).map_err(|_e| ()).map_err(
-                    |_| JsValue::from_str("Failed to parse JSON payload"),
-                )?
+                serde_json::from_slice(&items)?
             }
             cesrox::payload::Payload::CBOR(items) => {
-                serde_cbor::from_slice(&items).map_err(|_e| ()).map_err(
-                    |_| JsValue::from_str("Failed to parse CBOR payload"),
-                )?
+                serde_cbor::from_slice(&items)?
             }
-            cesrox::payload::Payload::MGPK(_items) => todo!(),
+            cesrox::payload::Payload::MGPK(_items) => {
+                return Err(WasmError::UnsupportedPayload("MGPK"))
+            }
         };
 
-        let vc_said = att.clone().digest.unwrap();
+        let vc_said = att.digest.clone().ok_or(WasmError::MissingSaid)?;
         let current_vc_state = self.get_vc_state(vc_said.to_string())?;
         if let VcState::Revoked = current_vc_state {
             let result: VerificationResult = VcState::Revoked.into();
             return Ok(result.into());
         }
 
-        let oobis: Vec<Oobi> =
-            serde_wasm_bindgen::from_value(oobi_array).unwrap_or(vec![]);
+        let oobis: Vec<Oobi> = if oobi_array.is_null()
+            || oobi_array.is_undefined()
+        {
+            vec![]
+        } else {
+            serde_wasm_bindgen::from_value(oobi_array).map_err(|e| {
+                WasmError::InvalidInput(format!("invalid OOBI array: {}", e))
+            })?
+        };
         let watcher_url = identifier
             .watcher_oobi
             .clone()
-            .ok_or_else(|| JsValue::from_str("Watcher for identifier not set"))?
+            .ok_or(WasmError::WatcherNotSet)?
             .url;
         self.resolve_oobis(&watcher_url.to_string(), oobis.clone())
-            .await
-            .map_err(|e| {
-                JsValue::from_str(&format!("Failed to resolve OOBIs: {:?}", e))
-            })?;
+            .await?;
 
         let issuer_id: IdentifierPrefix = att.issuer.parse().map_err(|e| {
-            JsValue::from_str(&format!("Failed to parse issuer ID: {}", e))
+            WasmError::InvalidInput(format!("failed to parse issuer ID: {}", e))
         })?;
         let current_state = self
             .inner
             .get_state(&issuer_id);
         let current_sn = current_state.clone().map(|s| s.sn);
-        let kel =
-            self.query_kel(identifier, issuer_id, current_sn).await.map_err(|e| {
-                JsValue::from_str(&format!("Failed to query KEL: {:?}", e))
-            })?;
+        let kel = self.query_kel(identifier, issuer_id, current_sn).await?;
         let skip_first = current_state.as_ref().map(|_| 1);
-        self.process_kel(kel, skip_first, None).map_err(|e| {
-            JsValue::from_str(&format!("Failed to process KEL: {:?}", e))
-        })?;
+        self.process_kel(kel, skip_first, None)?;
 
-        let tel =
-            self.query_tel(identifier, att.clone())
-                .await
-                .map_err(|e| {
-                    JsValue::from_str(&format!("Failed to query TEL: {:?}", e))
-                })?;
-        self.process_tel(tel).map_err(|e| {
-            JsValue::from_str(&format!("Failed to process TEL: {:?}", e))
-        })?;
+        let tel = self.query_tel(identifier, att.clone()).await?;
+        self.process_tel(tel)?;
 
         let vc_state = self.get_vc_state(vc_said.to_string())?;
         let result: VerificationResult = vc_state.into();
@@ -393,17 +379,15 @@ impl JsController {
 impl JsController {
     async fn resolve_oobis(
         &self,
-        watcher_url: &String,
+        watcher_url: &str,
         oobis: Vec<Oobi>,
-    ) -> Result<(), JsValue> {
+    ) -> Result<(), WasmError> {
         for oobi in oobis {
-            let _ = Request::post(&format!("{}resolve", watcher_url))
+            Request::post(&format!("{}resolve", watcher_url))
                 .header("Content-Type", "application/json")
-                .body(serde_json::to_string(&oobi).unwrap())
-                .unwrap()
+                .body(serde_json::to_string(&oobi)?)?
                 .send()
-                .await
-                .map_err(|e| JsValue::from_str(&e.to_string()));
+                .await?;
         }
         Ok(())
     }
@@ -413,15 +397,25 @@ impl JsController {
         signing_id: &JsIdentifier,
         id: IdentifierPrefix,
         from_sn: Option<u64>,
-    ) -> Result<String, JsValue> {
-        let watcher_url = signing_id.watcher_oobi.clone().unwrap().url;
-        let watcher_id = signing_id.watcher_oobi.clone().unwrap().eid;
+    ) -> Result<String, WasmError> {
+        let watcher_oobi = signing_id
+            .watcher_oobi
+            .clone()
+            .ok_or(WasmError::WatcherNotSet)?;
+        let watcher_url = watcher_oobi.url;
+        let watcher_id = watcher_oobi.eid;
         let qry = signing_id.inner.get_log_query(id, watcher_id, from_sn, None);
         let signer = signing_id.signer.clone();
 
+        let encoded_qry = qry
+            .encode()
+            .map_err(|e| WasmError::Cesr(e.to_string()))?;
+        let signature = signer
+            .sign(encoded_qry)
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
         let sig = SelfSigningPrefix::new(
             cesrox::primitives::codes::self_signing::SelfSigning::Ed25519Sha512,
-            signer.sign(qry.encode().unwrap()).unwrap(),
+            signature,
         );
         let signatures = vec![IndexedSignature::new_both_same(sig, 0)];
         let singed_kel_qry = SignedKelQuery::new_trans(
@@ -436,31 +430,19 @@ impl JsController {
             let signed_qry =
                 SignedQueryMessage::KelQuery(singed_kel_qry.clone());
 
-            let body_msg =
-                Message::Op(Op::Query(signed_qry)).to_cesr().unwrap();
+            let body_msg = Message::Op(Op::Query(signed_qry))
+                .to_cesr()
+                .map_err(|e| WasmError::Cesr(e.to_string()))?;
             let body = js_sys::Uint8Array::from(body_msg.as_slice());
-            let response =
-                Request::post(watcher_url.join("query").unwrap().as_str())
-                    .header("Content-Type", "application/json")
-                    .body(&body)
-                    .unwrap()
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        JsValue::from_str(&format!(
-                            "Failed to send request: {}",
-                            e
-                        ))
-                    })?;
+            let response = Request::post(watcher_url.join("query")?.as_str())
+                .header("Content-Type", "application/json")
+                .body(&body)?
+                .send()
+                .await?;
 
             let code = response.status();
             if code == 200 {
-                kel = response.text().await.map_err(|e| {
-                    JsValue::from_str(&format!(
-                        "Failed to get response text: {}",
-                        e
-                    ))
-                })?;
+                kel = response.text().await?;
                 break;
             } else {
                 gloo_timers::future::TimeoutFuture::new(
@@ -478,11 +460,22 @@ impl JsController {
         &self,
         id: &JsIdentifier,
         acdc_attestation: acdc::Attestation,
-    ) -> Result<String, JsValue> {
-        let watcher_url = id.watcher_oobi.clone().unwrap().url;
-        let vc_said = acdc_attestation.digest.unwrap();
-        let registry_id: said::SelfAddressingIdentifier =
-            acdc_attestation.registry_identifier.parse().unwrap();
+    ) -> Result<String, WasmError> {
+        let watcher_url = id
+            .watcher_oobi
+            .clone()
+            .ok_or(WasmError::WatcherNotSet)?
+            .url;
+        let vc_said = acdc_attestation.digest.ok_or(WasmError::MissingSaid)?;
+        let registry_id: said::SelfAddressingIdentifier = acdc_attestation
+            .registry_identifier
+            .parse()
+            .map_err(|e| {
+                WasmError::InvalidInput(format!(
+                    "invalid registry identifier: {}",
+                    e
+                ))
+            })?;
         let signer = id.signer.clone();
 
         let tel_qry = id
@@ -491,11 +484,17 @@ impl JsController {
                 IdentifierPrefix::SelfAddressing(registry_id.into()),
                 IdentifierPrefix::SelfAddressing(vc_said.clone().into()),
             )
-            .unwrap();
+            .map_err(WasmError::Controller)?;
 
+        let encoded_qry = tel_qry
+            .encode()
+            .map_err(|e| WasmError::Cesr(e.to_string()))?;
+        let signature = signer
+            .sign(encoded_qry)
+            .map_err(|e| WasmError::Signing(e.to_string()))?;
         let signature_tel_query = SelfSigningPrefix::new(
             cesrox::primitives::codes::self_signing::SelfSigning::Ed25519Sha512,
-            signer.sign(tel_qry.encode().unwrap()).unwrap(),
+            signature,
         );
 
         let tel_query = match &id.inner.id {
@@ -523,31 +522,20 @@ impl JsController {
         let mut delay = std::time::Duration::from_secs(1);
         let mut tel = "".to_string();
         for _i in 0..5 {
-            let body = js_sys::Uint8Array::from(
-                tel_query.to_cesr().unwrap().as_slice(),
-            );
+            let body_msg = tel_query
+                .to_cesr()
+                .map_err(|e| WasmError::Cesr(e.to_string()))?;
+            let body = js_sys::Uint8Array::from(body_msg.as_slice());
             let response =
-                Request::post(watcher_url.join("query/tel").unwrap().as_str())
+                Request::post(watcher_url.join("query/tel")?.as_str())
                     .header("Content-Type", "application/json")
-                    .body(&body)
-                    .unwrap()
+                    .body(&body)?
                     .send()
-                    .await
-                    .map_err(|e| {
-                        JsValue::from_str(&format!(
-                            "Failed to send request: {}",
-                            e
-                        ))
-                    })?;
+                    .await?;
 
             let code = response.status();
             if code == 200 {
-                tel = response.text().await.map_err(|e| {
-                    JsValue::from_str(&format!(
-                        "Failed to get response text: {}",
-                        e
-                    ))
-                })?;
+                tel = response.text().await?;
                 break;
             } else {
                 gloo_timers::future::TimeoutFuture::new(
@@ -571,6 +559,8 @@ impl From<VerificationResult> for JsValue {
     fn from(val: VerificationResult) -> Self {
         let obj = js_sys::Object::new();
 
+        // Reflect::set on a freshly created object cannot fail — these
+        // expects guard an invariant, not fallible input.
         js_sys::Reflect::set(&obj, &JsValue::from_str("verified"), &JsValue::from_bool(val.verified))
             .expect("setting verified failed");
 

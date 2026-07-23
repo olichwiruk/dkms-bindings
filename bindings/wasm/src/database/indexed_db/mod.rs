@@ -1021,17 +1021,15 @@ impl IndexedDbDatabase {
         for sn in sequence_numbers {
             if let Some(said) = kels_map.get(&(id.to_string(), sn)) {
                 // Get non-transferable couplets for this digest
-                if let Ok(nontrans) = self.log_db.get_nontrans_couplets_by_key(said) {
+                if let Ok(Some(nontrans)) = self.log_db.get_nontrans_couplets_by_key(said) {
                     // Parse identifier
                     if let Ok(identifier) = id.parse::<IdentifierPrefix>() {
                         // Create receipt
                         let rct = Receipt::new(SerializationFormats::JSON, said.clone(), identifier, start);
-                        
+
                         // Create signed receipt with signatures
-                        let signatures = nontrans
-                            .unwrap()
-                            .collect();
-                        
+                        let signatures = nontrans.collect();
+
                         let signed_receipt = SignedNontransferableReceipt {
                             body: rct,
                             signatures,
